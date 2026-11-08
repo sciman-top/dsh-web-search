@@ -1,0 +1,429 @@
+name: Sync Fork
+on:
+  schedule:
+    - cron: "0 13 * * 5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Resolve upstream
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_FULL_NAME=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // empty')
+          if [ -z "$UPSTREAM_FULL_NAME" ]; then
+            echo "::warning::Upstream repo metadata is missing. Sync skipped to preserve fork."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! gh api "repos/$UPSTREAM_FULL_NAME" >/dev/null 2>&1; then
+            echo "::warning::Upstream repo $UPSTREAM_FULL_NAME is unavailable or deleted. Sync skipped to preserve fork."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          UPSTREAM_BRANCH=$(gh api "repos/$UPSTREAM_FULL_NAME" --jq '.default_branch // empty')
+          UPSTREAM_URL=$(gh api "repos/$UPSTREAM_FULL_NAME" --jq '.clone_url')
+          echo "full_name=$UPSTREAM_FULL_NAME" >> "$GITHUB_OUTPUT"
+          echo "owner=${UPSTREAM_FULL_NAME%%/*}" >> "$GITHUB_OUTPUT"
+          echo "branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "url=$UPSTREAM_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Safety check - compare file counts
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "${{ steps.upstream.outputs.url }}"
+          git fetch upstream "${{ steps.upstream.outputs.branch }}"
+          FORK_FILES=$(git ls-tree -r --name-only HEAD | wc -l | tr -d '[:space:]')
+          UPSTREAM_FILES=$(git ls-tree -r --name-only "upstream/${{ steps.upstream.outputs.branch }}" | wc -l | tr -d '[:space:]')
+          THRESHOLD=$(( (FORK_FILES + 1) / 2 ))
+          echo "Fork files: $FORK_FILES"
+          echo "Upstream files: $UPSTREAM_FILES"
+          if [ "$UPSTREAM_FILES" -lt "$THRESHOLD" ]; then
+            echo "::error::SAFETY ABORT: Upstream has $UPSTREAM_FILES files vs fork's $FORK_FILES. Possible upstream deletion. Sync skipped."
+            exit 1
+          fi
+          echo "Safety check passed."
+
+      - name: Diff guard - inspect deletions
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          BASE_REF: ${{ github.event.repository.default_branch }}
+          HEAD_REF: ${{ steps.upstream.outputs.owner }}:${{ steps.upstream.outputs.branch }}
+        run: |
+          set -euo pipefail
+          FORK_FILES=$(git ls-tree -r --name-only HEAD | wc -l | tr -d '[:space:]')
+          COMPARE_BASE=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["BASE_REF"], safe=":"))')
+          COMPARE_HEAD=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["HEAD_REF"], safe=":"))')
+          COMPARE_JSON=$(gh api "repos/${{ github.repository }}/compare/${COMPARE_BASE}...${COMPARE_HEAD}")
+          if ! printf '%s' "$COMPARE_JSON" | jq -e '.files | type == "array"' >/dev/null; then
+            echo "::error::SAFETY ABORT: compare response files payload is malformed."
+            exit 1
+          fi
+          COMPARE_FILE_COUNT=$(printf '%s' "$COMPARE_JSON" | jq -r '.files | length')
+          if [ "$COMPARE_FILE_COUNT" -ge 300 ]; then
+            echo "::error::SAFETY ABORT: compare file list may be truncated at 300 entries."
+            exit 1
+          fi
+          DELETED_FILES=$(printf '%s' "$COMPARE_JSON" | jq -r '.files[]? | select(.status == "removed") | .filename')
+          DELETED_FILE_COUNT=$(printf '%s' "$COMPARE_JSON" | jq -r '[.files[]? | select(.status == "removed")] | length')
+          DELETE_LIMIT=$(( 5 + (FORK_FILES / 10) ))
+          echo "Deleted files: $DELETED_FILE_COUNT"
+          echo "Deletion limit: $DELETE_LIMIT"
+          if [ "$DELETED_FILE_COUNT" -gt "$DELETE_LIMIT" ]; then
+            echo "::error::SAFETY ABORT: deletion volume is too large for a safe sync."
+            exit 1
+          fi
+          if printf '%s\n' "$DELETED_FILES" | grep -Eqi '^(\.github/|README(?:\.[^/]*)?$|LICENSE(?:\.[^/]*)?$|sync-fork\.yml$)'; then
+            echo "::error::SAFETY ABORT: critical path deletion detected."
+            exit 1
+          fi
+
+      - name: Create restore point
+        if: steps.upstream.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BACKUP_BRANCH="backup/pre-sync"
+          git branch -f "$BACKUP_BRANCH" HEAD
+          git push origin "$BACKUP_BRANCH" --force
+
+      - name: Merge upstream changes
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          gh api repos/${{ github.repository }}/merge-upstream -X POST -f branch=${{ github.event.repository.default_branch }}
+
+      - name: Verify upstream convergence
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          BASE_REF: ${{ github.event.repository.default_branch }}
+          HEAD_REF: ${{ steps.upstream.outputs.owner }}:${{ steps.upstream.outputs.branch }}
+        run: |
+          set -euo pipefail
+          COMPARE_BASE=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["BASE_REF"], safe=":"))')
+          COMPARE_HEAD=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["HEAD_REF"], safe=":"))')
+          COMPARE_JSON=$(gh api "repos/${{ github.repository }}/compare/${COMPARE_BASE}...${COMPARE_HEAD}")
+          if ! printf '%s' "$COMPARE_JSON" | jq -e '.ahead_by | numbers' >/dev/null; then
+            echo "::error::SAFETY ABORT: post-sync compare response has malformed ahead_by."
+            exit 1
+          fi
+          BEHIND_BY=$(printf '%s' "$COMPARE_JSON" | jq -r '.ahead_by')
+          if [ "$BEHIND_BY" -ne 0 ]; then
+            echo "::error::SAFETY ABORT: fork remains $BEHIND_BY upstream commit(s) behind."
+            exit 1
+          fi
+          echo "Verified: fork is not behind upstream."
+
+      - name: Release retention policy
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tempfile
+          from urllib.parse import quote
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          installable_re = re.compile(r"\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\.gz)$", re.IGNORECASE)
+          signed_re = re.compile(r"\.(?:sig|minisig|sigstore)$", re.IGNORECASE)
+          checksum_algorithms = {
+              "sha256sums": "sha256",
+              "sha256sums.txt": "sha256",
+              "sha512sums": "sha512",
+              "sha512sums.txt": "sha512",
+          }
+
+          def gh_json(args):
+              cmd = ["gh", *args]
+              result = subprocess.run(
+                  cmd, capture_output=True, text=True, check=False, timeout=600
+              )
+              if result.returncode != 0:
+                  raise RuntimeError(result.stderr.strip() or "gh command failed")
+              return json.loads(result.stdout)
+
+          def gh_run(args):
+              cmd = ["gh", *args]
+              result = subprocess.run(
+                  cmd, capture_output=True, text=True, check=False, timeout=600
+              )
+              if result.returncode != 0:
+                  raise RuntimeError(result.stderr.strip() or "gh command failed")
+
+          def gh_paginate(endpoint):
+              results = []
+              separator = "&" if "?" in endpoint else "?"
+              for page in range(1, 51):
+                  batch = gh_json([
+                      "api", f"{endpoint}{separator}per_page=100&page={page}"
+                  ])
+                  if not isinstance(batch, list):
+                      raise RuntimeError("invalid paginated release response")
+                  results.extend(batch)
+                  if len(batch) < 100:
+                      return results
+              raise RuntimeError("release pagination limit exceeded")
+
+          def stable(releases):
+              return [
+                  release for release in releases
+                  if isinstance(release, dict)
+                  and not release.get("draft")
+                  and not release.get("prerelease")
+              ]
+
+          def required_asset_names(release):
+              assets = release.get("assets") or []
+              names = []
+              for asset in assets:
+                  name = asset.get("name")
+                  if not isinstance(name, str):
+                      continue
+                  if (
+                      not name
+                      or name in {".", ".."}
+                      or name.startswith("-")
+                      or "/" in name
+                      or "\\" in name
+                      or "\0" in name
+                  ):
+                      raise RuntimeError(f"unsafe release asset name: {name!r}")
+                  lowered = name.lower()
+                  if (
+                      installable_re.search(name)
+                      or signed_re.search(name)
+                      or lowered == "latest.json"
+                      or lowered in checksum_algorithms
+                  ):
+                      names.append(name)
+              return names
+
+          def assets_by_name(release):
+              return {
+                  asset.get("name"): asset
+                  for asset in (release.get("assets") or [])
+                  if isinstance(asset, dict)
+                  and isinstance(asset.get("name"), str)
+              }
+
+          def proven_upstream_mirror(fork_asset, upstream_asset):
+              if not isinstance(fork_asset, dict) or not isinstance(upstream_asset, dict):
+                  return False
+              if fork_asset.get("name") != upstream_asset.get("name"):
+                  return False
+              fork_digest = fork_asset.get("digest")
+              upstream_digest = upstream_asset.get("digest")
+              if isinstance(fork_digest, str) and isinstance(upstream_digest, str):
+                  return bool(fork_digest) and fork_digest == upstream_digest
+              fork_size = fork_asset.get("size")
+              upstream_size = upstream_asset.get("size")
+              return (
+                  isinstance(fork_size, int)
+                  and not isinstance(fork_size, bool)
+                  and isinstance(upstream_size, int)
+                  and not isinstance(upstream_size, bool)
+                  and fork_size >= 0
+                  and fork_size == upstream_size
+              )
+
+          repo_meta = gh_json(["api", f"repos/{repo}"])
+          upstream = ((repo_meta.get("parent") or {}).get("full_name") or "").strip()
+          if not upstream:
+              print("::notice::Upstream repo metadata is missing; release retention skipped.")
+              raise SystemExit(0)
+
+          upstream_releases = gh_paginate(f"repos/{upstream}/releases")
+          fork_releases = gh_paginate(f"repos/{repo}/releases")
+          upstream_stable = stable(upstream_releases)
+          if not upstream_stable:
+              print("::notice::source-only release notes policy: upstream has no stable releases.")
+              raise SystemExit(0)
+
+          latest = upstream_stable[0]
+          tag = latest.get("tag_name")
+          if not tag:
+              print("::notice::Latest stable release has no tag; release retention skipped.")
+              raise SystemExit(0)
+
+          required = required_asset_names(latest)
+          if not required:
+              print("::notice::source-only release notes policy: upstream latest stable release has no mirrored assets.")
+              raise SystemExit(0)
+
+          latest_fork = None
+          for release in fork_releases:
+              if isinstance(release, dict) and release.get("tag_name") == tag:
+                  latest_fork = release
+                  break
+
+          if latest_fork is None:
+              payload_path = None
+              try:
+                  with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+                      json.dump({
+                          "tag_name": tag,
+                          "target_commitish": os.environ["GITHUB_REF_NAME"],
+                          "name": latest.get("name") or tag,
+                          "body": latest.get("body") or "",
+                          "draft": False,
+                          "prerelease": False,
+                      }, handle, ensure_ascii=False)
+                      payload_path = handle.name
+                  gh_run(["api", f"repos/{repo}/releases", "-X", "POST", "--input", payload_path])
+                  latest_fork = {"tag_name": tag, "assets": []}
+              finally:
+                  if payload_path and os.path.exists(payload_path):
+                      os.unlink(payload_path)
+
+          fork_asset_names = {
+              asset.get("name")
+              for asset in (latest_fork.get("assets") or [])
+              if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+          }
+          missing = [name for name in required if name not in fork_asset_names]
+          required_by_lower = {name.lower(): name for name in required}
+          metadata_names = {"latest.json", *checksum_algorithms}
+          if any(name.lower() in metadata_names for name in missing):
+              for lowered in ("latest.json", *checksum_algorithms):
+                  asset_name = required_by_lower.get(lowered)
+                  if asset_name and asset_name not in missing:
+                      missing.append(asset_name)
+
+          if missing:
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  for asset_name in missing:
+                      gh_run([
+                          "release", "download", tag,
+                          "-R", upstream,
+                          "-D", tmpdir,
+                          "-p", asset_name,
+                          "--clobber",
+                      ])
+
+                  latest_name = required_by_lower.get("latest.json")
+                  latest_json = pathlib.Path(tmpdir) / latest_name if latest_name else None
+                  if latest_json is not None and latest_json.exists():
+                      text = latest_json.read_text(encoding="utf-8")
+                      try:
+                          json.loads(text)
+                      except json.JSONDecodeError as exc:
+                          raise RuntimeError(f"latest.json is invalid JSON: {exc.msg}") from exc
+                      raw_tag = tag
+                      encoded_tag = quote(tag, safe="")
+                      upstream_prefixes = [
+                          f"https://github.com/{upstream}/releases/download/{raw_tag}/",
+                          f"https://github.com/{upstream}/releases/download/{encoded_tag}/",
+                      ]
+                      fork_prefixes = [
+                          f"https://github.com/{repo}/releases/download/{raw_tag}/",
+                          f"https://github.com/{repo}/releases/download/{encoded_tag}/",
+                      ]
+                      rewritten = text
+                      for upstream_prefix, fork_prefix in zip(
+                          upstream_prefixes, fork_prefixes
+                      ):
+                          rewritten = rewritten.replace(upstream_prefix, fork_prefix)
+                      if rewritten == text and not any(
+                          prefix in text for prefix in fork_prefixes
+                      ):
+                          raise RuntimeError(
+                              "latest.json contains no managed GitHub download URL"
+                          )
+                      if any(prefix in rewritten for prefix in upstream_prefixes):
+                          raise RuntimeError(
+                              "latest.json still points to the upstream release"
+                          )
+                      if not any(prefix in rewritten for prefix in fork_prefixes):
+                          raise RuntimeError(
+                              "latest.json does not point to the fork release"
+                          )
+                      latest_json.write_text(rewritten, encoding="utf-8")
+
+                  for lowered, algorithm in checksum_algorithms.items():
+                      manifest_name = required_by_lower.get(lowered)
+                      if not manifest_name or latest_json is None:
+                          continue
+                      manifest = pathlib.Path(tmpdir) / manifest_name
+                      if not manifest.exists() or not latest_json.exists():
+                          continue
+                      latest_hash = hashlib.new(
+                          algorithm, latest_json.read_bytes()
+                      ).hexdigest()
+                      updated = []
+                      matched = False
+                      for line in manifest.read_text(encoding="utf-8").splitlines():
+                          parts = line.split()
+                          filename = parts[-1] if parts else ""
+                          normalized = (
+                              filename.lstrip("*")
+                              .replace("\\", "/")
+                              .rsplit("/", 1)[-1]
+                              .lower()
+                          )
+                          if normalized == "latest.json":
+                              updated.append(f"{latest_hash}  {filename}")
+                              matched = True
+                          else:
+                              updated.append(line)
+                      if not matched:
+                          raise RuntimeError(
+                              f"{manifest_name} does not contain latest.json"
+                          )
+                      manifest.write_text(
+                          "\n".join(updated) + "\n", encoding="utf-8"
+                      )
+
+                  upload_files = [str(pathlib.Path(tmpdir) / asset_name) for asset_name in missing]
+                  gh_run([
+                      "release", "upload", tag, *upload_files,
+                      "-R", repo, "--clobber",
+                  ])
+
+          upstream_by_tag = {
+              release.get("tag_name"): release
+              for release in stable(upstream_releases)
+              if release.get("tag_name") and release.get("tag_name") != tag
+          }
+          prune_plan = []
+          for release in stable(fork_releases):
+              old_tag = release.get("tag_name")
+              upstream_release = upstream_by_tag.get(old_tag)
+              if not old_tag or upstream_release is None:
+                  continue
+              upstream_assets = assets_by_name(upstream_release)
+              for name, asset in assets_by_name(release).items():
+                  if name not in required_asset_names(release):
+                      continue
+                  if proven_upstream_mirror(asset, upstream_assets.get(name)):
+                      prune_plan.append((old_tag, name))
+          for old_tag, name in prune_plan:
+              print(f"Pruning proven upstream mirror asset: {old_tag}/{name}")
+              gh_run(["release", "delete-asset", old_tag, name, "-R", repo, "--yes"])
+          PY
